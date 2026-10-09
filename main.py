@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from ortools.sat.python import cp_model
 
 app = FastAPI()
@@ -20,29 +20,24 @@ def resoudre(data: RequeteGarde):
 
     model = cp_model.CpModel()
 
-    # x[v_idx, p_idx, a_idx] = 1 si l'agent a occupe le poste p sur le véhicule v
+    # x[v, p, a] = 1 si l'agent a occupe le poste p sur le véhicule v
     x = {}
     for v_idx, v in enumerate(vehicules):
         for p_idx, b in enumerate(v["besoins"]):
             for a_idx, a in enumerate(agents):
-                # Un agent n'est éligible que s'il possède la qualification requise
                 if b == "Tout agent" or b in a["specs"]:
                     x[(v_idx, p_idx, a_idx)] = model.NewBoolVar(f"x_{v_idx}_{p_idx}_{a_idx}")
 
-    # u[v_idx] = 1 si le véhicule est entièrement armé
+    # u[v] = 1 si le véhicule est armé
     u = [model.NewBoolVar(f"u_{v_idx}") for v_idx in range(len(vehicules))]
 
     # 1. Contraintes de postes
     for v_idx, v in enumerate(vehicules):
-        if not v["besoins"]:
-            model.Add(u[v_idx] == 1)
-            continue
         for p_idx in range(len(v["besoins"])):
             candidats = [x[(v_idx, p_idx, a_idx)] for a_idx in range(len(agents)) if (v_idx, p_idx, a_idx) in x]
-            # Si le véhicule est armé, chaque poste doit avoir exactement 1 agent
             model.Add(sum(candidats) == u[v_idx])
 
-        # Sur un même véhicule, une personne ne peut occuper qu'un seul poste
+        # 1 personne = max 1 poste sur un même engin
         for a_idx in range(len(agents)):
             postes_agent = [x[(v_idx, p_idx, a_idx)] for p_idx in range(len(v["besoins"])) if (v_idx, p_idx, a_idx) in x]
             model.Add(sum(postes_agent) <= 1)
@@ -59,37 +54,41 @@ def resoudre(data: RequeteGarde):
                 model.Add(var == 0)
             is_on_veh[(a_idx, v_idx)] = var
 
-    # 3. Règle d'exclusivité des véhicules prioritaires
+    # 3. Règle d'exclusivité stricte pour les prioritaires
     for v_idx, v in enumerate(vehicules):
         if v.get("prioritaire"):
             for a_idx in range(len(agents)):
                 autres = [is_on_veh[(a_idx, other_v)] for other_v in range(len(vehicules)) if other_v != v_idx]
-                # Si l'agent est sur ce véhicule prioritaire, il ne peut être sur aucun autre
+                # Si l'agent est sur un véhicule prioritaire, il ne peut être sur aucun autre
                 model.Add(sum(autres) == 0).OnlyEnforceIf(is_on_veh[(a_idx, v_idx)])
 
     # 4. Fonction Objectif (Maximisation globale)
     termes_objectif = []
-    
-    # Fort bonus pour armer les véhicules (priorité absolue à ceux ayant un rang élevé)
+
     for v_idx, v in enumerate(vehicules):
-        poids = 100000 - (v.get("rangPrio", 999) * 1000)
+        if v.get("prioritaire"):
+            # Les prioritaires rapportent entre 50 000 et 100 000 points selon leur rang
+            poids = 100000 - min(v.get("rangPrio", 1) * 1000, 50000)
+        else:
+            # Poids positif pour armer tous les autres véhicules
+            poids = 10000
         termes_objectif.append(u[v_idx] * poids)
 
-    # Pénalité pour le multi-armement (minimiser le nombre d'engins par agent)
+    # Pénalité légère pour le multi-armement : limite le nombre de véhicules par agent
     for a_idx in range(len(agents)):
         total_veh = sum(is_on_veh[(a_idx, v_idx)] for v_idx in range(len(vehicules)))
         termes_objectif.append(-10 * total_veh)
 
     model.Maximize(sum(termes_objectif))
 
-    # Résolution
+    # Résolution mathématique
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 10.0
     status = solver.Solve(model)
 
     resultats = []
     for v_idx, v in enumerate(vehicules):
-        arme = bool(solver.Value(u[v_idx])) if v["besoins"] else True
+        arme = bool(solver.Value(u[v_idx]))
         equipage = []
         for p_idx, b in enumerate(v["besoins"]):
             assigne = "MANQUANT"
@@ -99,7 +98,7 @@ def resoudre(data: RequeteGarde):
                         assigne = a["nom"]
                         break
             equipage.append({"specialite": b, "agent": assigne})
-        
+
         resultats.append({
             "nom": v["nom"],
             "arme": arme,
