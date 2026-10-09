@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from ortools.sat.python import cp_model
 import re
 
@@ -30,8 +30,7 @@ def resoudre(data: RequeteGarde):
 
     model = cp_model.CpModel()
 
-    # Détection des groupes et priorités
-    # Si la priorité contient "groupe" ou "g" suivi d'un id (ex: "Groupe 1", "G1")
+    # 1. Détection des groupes jumeaux (ex: "G1", "Groupe 1", "G2"...)
     groupes_jumeaux = {}
     for v_idx, v in enumerate(vehicules):
         prio_str = str(v.get("priorite", "")).strip().lower()
@@ -42,30 +41,30 @@ def resoudre(data: RequeteGarde):
                 groupes_jumeaux[grp_id] = []
             groupes_jumeaux[grp_id].append(v_idx)
 
-    # Variables de décision
-    # x[v, p, a] = 1 si l'agent a occupe le poste p sur l'engin v
+    # 2. Variables de décision
+    # x[v, p, a] = 1 si l'agent a occupe le poste p sur le véhicule v
     x = {}
     for v_idx, v in enumerate(vehicules):
         for p_idx, b in enumerate(v["besoins"]):
             for a_idx, a in enumerate(agents):
-                if b == "Tout agent" or b in a["specs"]:
+                if b == "Tout agent" or b in a.get("specs", []):
                     x[(v_idx, p_idx, a_idx)] = model.NewBoolVar(f"x_{v_idx}_{p_idx}_{a_idx}")
 
-    # u[v] = 1 si l'engin est armé
+    # u[v] = 1 si le véhicule est armé
     u = [model.NewBoolVar(f"u_{v_idx}") for v_idx in range(len(vehicules))]
 
-    # 1. Contraintes de postes
+    # 3. Contraintes des postes d'armement
     for v_idx, v in enumerate(vehicules):
         for p_idx in range(len(v["besoins"])):
             candidats = [x[(v_idx, p_idx, a_idx)] for a_idx in range(len(agents)) if (v_idx, p_idx, a_idx) in x]
             model.Add(sum(candidats) == u[v_idx])
 
-        # 1 agent = max 1 poste sur le même véhicule
+        # 1 agent = maximum 1 poste sur un même véhicule
         for a_idx in range(len(agents)):
             postes_agent = [x[(v_idx, p_idx, a_idx)] for p_idx in range(len(v["besoins"])) if (v_idx, p_idx, a_idx) in x]
             model.Add(sum(postes_agent) <= 1)
 
-    # 2. Présence d'un agent sur un véhicule
+    # 4. Présence globale d'un agent sur un véhicule
     is_on_veh = {}
     for a_idx in range(len(agents)):
         for v_idx in range(len(vehicules)):
@@ -77,23 +76,23 @@ def resoudre(data: RequeteGarde):
                 model.Add(var == 0)
             is_on_veh[(a_idx, v_idx)] = var
 
-    # 3. Règle d'exclusivité des prioritaires réels (1, 2, 3...)
+    # 5. Règle d'exclusivité des prioritaires (1, 2, 3...)
+    # Si un véhicule est prioritaire strict, son équipage ne monte sur aucun autre engin
     for v_idx, v in enumerate(vehicules):
         if v.get("prioritaire"):
             for a_idx in range(len(agents)):
                 autres = [is_on_veh[(a_idx, other_v)] for other_v in range(len(vehicules)) if other_v != v_idx]
                 model.Add(sum(autres) == 0).OnlyEnforceIf(is_on_veh[(a_idx, v_idx)])
 
-    # 4. RÈGLE JUMEAUX (Groupe 1, Groupe 2...)
-    # Les véhicules d'un même groupe ont strictement le même équipage
+    # 6. Règle des véhicules jumeaux (G1, G2...)
     for grp_id, v_indices in groupes_jumeaux.items():
         if len(v_indices) >= 2:
             v_ref = v_indices[0]
             for other_v in v_indices[1:]:
-                # Ils sont armés ensemble
+                # Armés ensemble ou aucun des deux
                 model.Add(u[v_ref] == u[other_v])
-                
-                # S'ils ont les mêmes postes, forcer les mêmes agents poste par poste
+
+                # Même équipage imposé sur chaque poste commun
                 nb_postes = min(len(vehicules[v_ref]["besoins"]), len(vehicules[other_v]["besoins"]))
                 for p_idx in range(nb_postes):
                     for a_idx in range(len(agents)):
@@ -102,8 +101,8 @@ def resoudre(data: RequeteGarde):
                         if var_ref is not None and var_other is not None:
                             model.Add(var_ref == var_other)
 
-    # 5. RÈGLE PORTEUR ET CELLULES (VPCE et Ce...)
-    # Un agent ne peut PAS être à la fois sur le VPCE et sur une cellule Ce...
+    # 7. Règle Porteur & Cellules (VPCE et Ce...)
+    # Un agent ne peut pas conduire le VPCE et armer sa cellule portée
     indices_vpce = [i for i, v in enumerate(vehicules) if v["nom"].upper().startswith("VPCE")]
     indices_cellules = [i for i, v in enumerate(vehicules) if v["nom"].upper().startswith("CE")]
 
@@ -112,8 +111,10 @@ def resoudre(data: RequeteGarde):
             for a_idx in range(len(agents)):
                 model.Add(is_on_veh[(a_idx, vpce_idx)] + is_on_veh[(a_idx, ce_idx)] <= 1)
 
-    # 6. Fonction Objectif
+    # 8. Fonction Objectif (Maximisation & Pénalités progressives de cumul)
     termes_objectif = []
+
+    # Gain principal : armer un maximum d'engins en respectant le rang de priorité
     for v_idx, v in enumerate(vehicules):
         if v.get("prioritaire"):
             poids = 100000 - min(v.get("rangPrio", 1) * 1000, 50000)
@@ -121,14 +122,35 @@ def resoudre(data: RequeteGarde):
             poids = 10000
         termes_objectif.append(u[v_idx] * poids)
 
-    # Pénalité légère pour limiter le multi-armement inutile
+    # Pénalités par paliers de surcharge par agent
     for a_idx in range(len(agents)):
-        total_veh = sum(is_on_veh[(a_idx, v_idx)] for v_idx in range(len(vehicules)))
-        termes_objectif.append(-5 * total_veh)
+        tot = sum(is_on_veh[(a_idx, v_idx)] for v_idx in range(len(vehicules)))
+
+        ge_2 = model.NewBoolVar(f"ge_2_{a_idx}")
+        ge_3 = model.NewBoolVar(f"ge_3_{a_idx}")
+        ge_4 = model.NewBoolVar(f"ge_4_{a_idx}")
+        ge_5 = model.NewBoolVar(f"ge_5_{a_idx}")
+
+        model.Add(tot >= 2).OnlyEnforceIf(ge_2)
+        model.Add(tot < 2).OnlyEnforceIf(ge_2.Not())
+
+        model.Add(tot >= 3).OnlyEnforceIf(ge_3)
+        model.Add(tot < 3).OnlyEnforceIf(ge_3.Not())
+
+        model.Add(tot >= 4).OnlyEnforceIf(ge_4)
+        model.Add(tot < 4).OnlyEnforceIf(ge_4.Not())
+
+        model.Add(tot >= 5).OnlyEnforceIf(ge_5)
+        model.Add(tot < 5).OnlyEnforceIf(ge_5.Not())
+
+        termes_objectif.append(-100 * ge_2)
+        termes_objectif.append(-300 * ge_3)
+        termes_objectif.append(-1000 * ge_4)
+        termes_objectif.append(-3000 * ge_5)
 
     model.Maximize(sum(termes_objectif))
 
-    # Résolution
+    # 9. Résolution
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 10.0
     status = solver.Solve(model)
