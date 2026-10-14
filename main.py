@@ -29,6 +29,7 @@ async def options_resoudre():
     return JSONResponse(content={"status": "ok"}, headers=CORS_HEADERS)
 
 def est_engin_faisable(v: Dict[str, Any], agents: List[Dict[str, Any]]) -> bool:
+    """Vérifie si l'effectif présent permet mathématiquement d'armer cet engin."""
     besoins = [str(b).strip() for b in v.get("besoins", []) if b]
     if not besoins:
         return len(agents) >= 1
@@ -52,7 +53,7 @@ def est_engin_faisable(v: Dict[str, Any], agents: List[Dict[str, Any]]) -> bool:
 @app.get("/")
 def home():
     return JSONResponse(
-        content={"status": "en ligne", "service": "CIS Optimiseur OR-Tools v4.1"},
+        content={"status": "en ligne", "service": "CIS Optimiseur OR-Tools v5 (Indépendance & Fusion d'équipages)"},
         headers=CORS_HEADERS
     )
 
@@ -65,7 +66,6 @@ async def resoudre(request: Request):
         agents_raw = data.get("agents", [])
         vehicules_raw = data.get("vehicules", [])
 
-        # Nettoyage strict des types pour éviter tout crash Python
         agents = []
         for a in agents_raw:
             agents.append({
@@ -88,7 +88,9 @@ async def resoudre(request: Request):
 
         model = cp_model.CpModel()
 
-        # 1. Groupes jumeaux (G1, G2...)
+        # =====================================================================
+        # 1. GROUPES JUMEAUX EXPLICITES (ex: "G1", "Groupe 1", "G2"...)
+        # =====================================================================
         groupes_jumeaux = {}
         vehicule_vers_groupe = {}
         for v_idx, v in enumerate(vehicules):
@@ -101,14 +103,18 @@ async def resoudre(request: Request):
                 groupes_jumeaux[grp_id].append(v_idx)
                 vehicule_vers_groupe[v_idx] = grp_id
 
-        # 2. Véhicules faisables
+        # =====================================================================
+        # 2. VÉHICULES MATHÉMATIQUEMENT FAISABLES AUJOURD'HUI
+        # =====================================================================
         vehicules_faisables = {v_idx: est_engin_faisable(v, agents) for v_idx, v in enumerate(vehicules)}
         for grp_id, v_indices in groupes_jumeaux.items():
             if not all(vehicules_faisables[i] for i in v_indices):
                 for i in v_indices:
                     vehicules_faisables[i] = False
 
-        # 3. Rareté utile
+        # =====================================================================
+        # 3. RARETÉ UTILE DES COMPÉTENCES
+        # =====================================================================
         demande_specs = {}
         groupes_comptes = set()
         for v_idx, v in enumerate(vehicules):
@@ -153,7 +159,9 @@ async def resoudre(request: Request):
                 reste_r = sum(scores_utiles[1:])
                 capital_agent.append(int(round(max_r + 0.2 * reste_r)))
 
-        # 4. Variables de décision
+        # =====================================================================
+        # 4. VARIABLES DE DÉCISION & CONTRAINTES DE POSTES
+        # =====================================================================
         x = {}
         for v_idx, v in enumerate(vehicules):
             for p_idx, b in enumerate(v["besoins"]):
@@ -187,7 +195,9 @@ async def resoudre(request: Request):
                     model.Add(var == 0)
                 is_on_veh[(a_idx, v_idx)] = var
 
-        # 5. Exclusivité des prioritaires
+        # =====================================================================
+        # 5. EXCLUSIVITÉ DES PRIORITAIRES STRICTS (1, 2, 3...)
+        # =====================================================================
         for v_idx, v in enumerate(vehicules):
             if v["prioritaire"]:
                 for a_idx in range(len(agents)):
@@ -195,7 +205,9 @@ async def resoudre(request: Request):
                     if autres:
                         model.Add(sum(autres) == 0).OnlyEnforceIf(is_on_veh[(a_idx, v_idx)])
 
-        # 6. Véhicules jumeaux
+        # =====================================================================
+        # 6. VÉHICULES JUMEAUX EXPLICITES (G1, G2...)
+        # =====================================================================
         for grp_id, v_indices in groupes_jumeaux.items():
             if len(v_indices) >= 2:
                 v_ref = v_indices[0]
@@ -209,7 +221,9 @@ async def resoudre(request: Request):
                             if var_ref is not None and var_other is not None:
                                 model.Add(var_ref == var_other)
 
-        # 7. Règle VPCE & Cellules
+        # =====================================================================
+        # 7. RÈGLE PORTEUR & CELLULES (VPCE et Ce...)
+        # =====================================================================
         indices_vpce = [i for i, v in enumerate(vehicules) if v["nom"].upper().startswith("VPCE")]
         indices_cellules = [i for i, v in enumerate(vehicules) if v["nom"].upper().startswith("CE")]
 
@@ -218,17 +232,21 @@ async def resoudre(request: Request):
                 for a_idx in range(len(agents)):
                     model.Add(is_on_veh[(a_idx, vpce_idx)] + is_on_veh[(a_idx, ce_idx)] <= 1)
 
-        # 8. Fonction Objectif
+        # =====================================================================
+        # 8. FONCTION OBJECTIF : INDÉPENDANCE MAXIMALE + FUSION DES CONFLITS
+        # =====================================================================
         termes_objectif = []
 
+        # A. Armer un maximum de véhicules
         for v_idx, v in enumerate(vehicules):
             score_rarete_engin = sum(rarete_spec.get(b, 1) for b in v["besoins"])
             if v["prioritaire"]:
                 poids = 100000 - min(v["rangPrio"] * 1000, 50000) + (score_rarete_engin * 2)
             else:
-                poids = 10000 + (score_rarete_engin * 2)
+                poids = 20000 + (score_rarete_engin * 2)
             termes_objectif.append(u[v_idx] * poids)
 
+        # Identification des unités d'armement distinctes (un groupe jumeau G1 = 1 unité)
         vehicules_secondaires_jumeaux = set()
         for grp_id, v_indices in groupes_jumeaux.items():
             if len(v_indices) >= 2:
@@ -236,14 +254,37 @@ async def resoudre(request: Request):
                     vehicules_secondaires_jumeaux.add(other_v)
         unites_vehicules = [v_idx for v_idx in range(len(vehicules)) if v_idx not in vehicules_secondaires_jumeaux]
 
+        # B. Matrice de conflit entre paires d'engins :
+        # Deux véhicules qui partagent au moins 1 agent ne peuvent plus partir ensemble (-1200 pts).
+        # Mais une fois que le conflit entre v1 et v2 existe (payé), partager un 2e ou 3e agent
+        # entre CES DEUX MÊMES véhicules ne recrée aucun nouveau conflit !
+        for idx1 in range(len(unites_vehicules)):
+            v1 = unites_vehicules[idx1]
+            if vehicules[v1]["prioritaire"]:
+                continue
+            for idx2 in range(idx1 + 1, len(unites_vehicules)):
+                v2 = unites_vehicules[idx2]
+                if vehicules[v2]["prioritaire"]:
+                    continue
+
+                conflit_v1_v2 = model.NewBoolVar(f"conflit_{v1}_{v2}")
+                for a_idx in range(len(agents)):
+                    model.Add(conflit_v1_v2 >= is_on_veh[(a_idx, v1)] + is_on_veh[(a_idx, v2)] - 1)
+
+                termes_objectif.append(-1200 * conflit_v1_v2)
+
+        # C. Gestion de la mobilisation et limitation stricte du cumul par agent
         for a_idx in range(len(agents)):
             tot = sum(is_on_veh[(a_idx, v_idx)] for v_idx in unites_vehicules)
 
+            ge_1 = model.NewBoolVar(f"ge_1_{a_idx}")
             ge_2 = model.NewBoolVar(f"ge_2_{a_idx}")
             ge_3 = model.NewBoolVar(f"ge_3_{a_idx}")
             ge_4 = model.NewBoolVar(f"ge_4_{a_idx}")
             ge_5 = model.NewBoolVar(f"ge_5_{a_idx}")
 
+            model.Add(tot >= 1).OnlyEnforceIf(ge_1)
+            model.Add(tot < 1).OnlyEnforceIf(ge_1.Not())
             model.Add(tot >= 2).OnlyEnforceIf(ge_2)
             model.Add(tot < 2).OnlyEnforceIf(ge_2.Not())
             model.Add(tot >= 3).OnlyEnforceIf(ge_3)
@@ -253,26 +294,36 @@ async def resoudre(request: Request):
             model.Add(tot >= 5).OnlyEnforceIf(ge_5)
             model.Add(tot < 5).OnlyEnforceIf(ge_5.Not())
 
-            malus_rarete_doublon = min(30, int(round(capital_agent[a_idx] / 10.0)))
+            # - Mobiliser un agent qui était au repos coûte -60 pts.
+            # - Réutiliser un agent sur un 2e véhicule déjà en conflit avec le 1er ne coûte que -15 pts :
+            #   le solveur préfère donc réutiliser les collègues de l'engin 1 (-15 pts) plutôt que
+            #   de mobiliser pour rien des agents neufs (-60 pts) sur un engin déjà bloqué par l'engin 1 !
+            # - Dès 3 véhicules et plus, forte pénalité (-900, -2500, -5000) pour interdire qu'un
+            #   même groupe d'agents ne soit réutilisé sur 3, 4 ou 5 camions.
+            malus_rarete_doublon = min(25, int(round(capital_agent[a_idx] / 12.0)))
 
-            termes_objectif.append((-250 - malus_rarete_doublon) * ge_2)
-            termes_objectif.append(-600 * ge_3)
-            termes_objectif.append(-1500 * ge_4)
-            termes_objectif.append(-4000 * ge_5)
+            termes_objectif.append(-60 * ge_1)
+            termes_objectif.append((-15 - malus_rarete_doublon) * ge_2)
+            termes_objectif.append(-900 * ge_3)
+            termes_objectif.append(-2500 * ge_4)
+            termes_objectif.append(-5000 * ge_5)
 
+        # D. Adéquation Poste / Compétence utile
         for (v_idx, p_idx, a_idx), var_x in x.items():
             b = vehicules[v_idx]["besoins"][p_idx]
             val_requise = rarete_spec.get(b, 1)
 
             gaspillage = max(0, capital_agent[a_idx] - val_requise)
-            penalite_surqualification = min(50, int(round(gaspillage / 6.0)))
+            penalite_surqualification = min(35, int(round(gaspillage / 8.0)))
 
             score_adequation = int(round(val_requise / 3.0)) - penalite_surqualification
             termes_objectif.append(var_x * score_adequation)
 
         model.Maximize(sum(termes_objectif))
 
-        # 9. Résolution
+        # =====================================================================
+        # 9. RÉSOLUTION
+        # =====================================================================
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 10.0
         status = solver.Solve(model)
