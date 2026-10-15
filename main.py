@@ -53,7 +53,7 @@ def est_engin_faisable(v: Dict[str, Any], agents: List[Dict[str, Any]]) -> bool:
 @app.get("/")
 def home():
     return JSONResponse(
-        content={"status": "en ligne", "service": "CIS Optimiseur OR-Tools v5 (Indépendance & Fusion d'équipages)"},
+        content={"status": "en ligne", "service": "CIS Optimiseur OR-Tools v6 (Priorité + Groupe G1..G99 séparés)"},
         headers=CORS_HEADERS
     )
 
@@ -81,6 +81,7 @@ async def resoudre(request: Request):
             vehicules.append({
                 "nom": str(v.get("nom", "")).strip(),
                 "priorite": str(v.get("priorite", "")).strip(),
+                "groupe": str(v.get("groupe", "")).strip().upper(),
                 "rangPrio": int(v.get("rangPrio", 999)) if str(v.get("rangPrio", "")).isdigit() else 999,
                 "prioritaire": bool(v.get("prioritaire", False)),
                 "besoins": besoins_propres
@@ -89,15 +90,20 @@ async def resoudre(request: Request):
         model = cp_model.CpModel()
 
         # =====================================================================
-        # 1. GROUPES JUMEAUX EXPLICITES (ex: "G1", "Groupe 1", "G2"...)
+        # 1. DÉTECTION DES GROUPES JUMEAUX (Colonne M : G1 à G99)
         # =====================================================================
         groupes_jumeaux = {}
         vehicule_vers_groupe = {}
         for v_idx, v in enumerate(vehicules):
-            prio_str = v["priorite"].lower()
-            m = re.match(r'^(groupe\s*\d+|g\d+)$', prio_str)
+            grp_raw = v["groupe"].lower()
+            # Rétrocompatibilité si quelqu'un a encore mis G1 dans priorite
+            if not grp_raw:
+                grp_raw = v["priorite"].lower()
+
+            m = re.match(r'^(?:groupe\s*|g)?([1-9]\d?)$', grp_raw) if v["groupe"] else re.match(r'^(groupe\s*\d+|g\d+)$', grp_raw)
             if m:
-                grp_id = m.group(1).replace(" ", "")
+                num_grp = re.sub(r'\D', '', m.group(0))
+                grp_id = f"g{num_grp}"
                 if grp_id not in groupes_jumeaux:
                     groupes_jumeaux[grp_id] = []
                 groupes_jumeaux[grp_id].append(v_idx)
@@ -196,17 +202,24 @@ async def resoudre(request: Request):
                 is_on_veh[(a_idx, v_idx)] = var
 
         # =====================================================================
-        # 5. EXCLUSIVITÉ DES PRIORITAIRES STRICTS (1, 2, 3...)
+        # 5. EXCLUSIVITÉ DES PRIORITAIRES (Compatible avec les groupes G1..G99)
         # =====================================================================
+        # Si un véhicule est prioritaire, ses agents ne peuvent être affectés sur
+        # aucun autre véhicule, SAUF ceux appartenant au même groupe jumeau (ex: G1).
         for v_idx, v in enumerate(vehicules):
             if v["prioritaire"]:
+                mon_groupe = vehicule_vers_groupe.get(v_idx)
                 for a_idx in range(len(agents)):
-                    autres = [is_on_veh[(a_idx, other_v)] for other_v in range(len(vehicules)) if other_v != v_idx]
+                    autres = [
+                        is_on_veh[(a_idx, other_v)]
+                        for other_v in range(len(vehicules))
+                        if other_v != v_idx and (mon_groupe is None or vehicule_vers_groupe.get(other_v) != mon_groupe)
+                    ]
                     if autres:
                         model.Add(sum(autres) == 0).OnlyEnforceIf(is_on_veh[(a_idx, v_idx)])
 
         # =====================================================================
-        # 6. VÉHICULES JUMEAUX EXPLICITES (G1, G2...)
+        # 6. VÉHICULES JUMEAUX (G1 à G99)
         # =====================================================================
         for grp_id, v_indices in groupes_jumeaux.items():
             if len(v_indices) >= 2:
@@ -237,7 +250,6 @@ async def resoudre(request: Request):
         # =====================================================================
         termes_objectif = []
 
-        # A. Armer un maximum de véhicules
         for v_idx, v in enumerate(vehicules):
             score_rarete_engin = sum(rarete_spec.get(b, 1) for b in v["besoins"])
             if v["prioritaire"]:
@@ -246,7 +258,6 @@ async def resoudre(request: Request):
                 poids = 20000 + (score_rarete_engin * 2)
             termes_objectif.append(u[v_idx] * poids)
 
-        # Identification des unités d'armement distinctes (un groupe jumeau G1 = 1 unité)
         vehicules_secondaires_jumeaux = set()
         for grp_id, v_indices in groupes_jumeaux.items():
             if len(v_indices) >= 2:
@@ -254,10 +265,7 @@ async def resoudre(request: Request):
                     vehicules_secondaires_jumeaux.add(other_v)
         unites_vehicules = [v_idx for v_idx in range(len(vehicules)) if v_idx not in vehicules_secondaires_jumeaux]
 
-        # B. Matrice de conflit entre paires d'engins :
-        # Deux véhicules qui partagent au moins 1 agent ne peuvent plus partir ensemble (-1200 pts).
-        # Mais une fois que le conflit entre v1 et v2 existe (payé), partager un 2e ou 3e agent
-        # entre CES DEUX MÊMES véhicules ne recrée aucun nouveau conflit !
+        # Matrice de conflit entre unités d'armement distinctes
         for idx1 in range(len(unites_vehicules)):
             v1 = unites_vehicules[idx1]
             if vehicules[v1]["prioritaire"]:
@@ -273,7 +281,7 @@ async def resoudre(request: Request):
 
                 termes_objectif.append(-1200 * conflit_v1_v2)
 
-        # C. Gestion de la mobilisation et limitation stricte du cumul par agent
+        # Gestion de la mobilisation et limitation stricte du cumul par agent
         for a_idx in range(len(agents)):
             tot = sum(is_on_veh[(a_idx, v_idx)] for v_idx in unites_vehicules)
 
@@ -294,12 +302,6 @@ async def resoudre(request: Request):
             model.Add(tot >= 5).OnlyEnforceIf(ge_5)
             model.Add(tot < 5).OnlyEnforceIf(ge_5.Not())
 
-            # - Mobiliser un agent qui était au repos coûte -60 pts.
-            # - Réutiliser un agent sur un 2e véhicule déjà en conflit avec le 1er ne coûte que -15 pts :
-            #   le solveur préfère donc réutiliser les collègues de l'engin 1 (-15 pts) plutôt que
-            #   de mobiliser pour rien des agents neufs (-60 pts) sur un engin déjà bloqué par l'engin 1 !
-            # - Dès 3 véhicules et plus, forte pénalité (-900, -2500, -5000) pour interdire qu'un
-            #   même groupe d'agents ne soit réutilisé sur 3, 4 ou 5 camions.
             malus_rarete_doublon = min(25, int(round(capital_agent[a_idx] / 12.0)))
 
             termes_objectif.append(-60 * ge_1)
@@ -308,7 +310,6 @@ async def resoudre(request: Request):
             termes_objectif.append(-2500 * ge_4)
             termes_objectif.append(-5000 * ge_5)
 
-        # D. Adéquation Poste / Compétence utile
         for (v_idx, p_idx, a_idx), var_x in x.items():
             b = vehicules[v_idx]["besoins"][p_idx]
             val_requise = rarete_spec.get(b, 1)
